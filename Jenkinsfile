@@ -20,35 +20,46 @@ spec:
     }
   }
 
-  parameters {
-    string(
-      name: 'REPO_URL',
-      defaultValue: 'https://github.com/iDave621/AWS-Luxe-Jewelry-Store',
-      description: 'Git repository to build from'
-    )
-    string(
-      name: 'ECR_REGISTRY',
-      defaultValue: '553817834164.dkr.ecr.us-east-1.amazonaws.com',
-      description: 'ECR registry'
-    )
-    string(
-      name: 'ECR_REPO',
-      defaultValue: 'luxe-jewelry-store',
-      description: 'Single ECR repository name'
-    )
-  }
-
   options {
     disableConcurrentBuilds()
+    timestamps()
+  }
+
+  parameters {
+    string(name: 'REPO_URL',      defaultValue: '', description: 'Git repository URL')
+    string(name: 'GIT_REF',       defaultValue: 'main', description: 'Branch / tag / commit')
+    string(name: 'PROJECT_NAME',  defaultValue: '', description: 'Microservice folder name')
+    string(name: 'ECR_REGISTRY',  defaultValue: '', description: 'ECR registry')
+    string(name: 'ECR_REPO',      defaultValue: '', description: 'ECR repository name')
+    string(name: 'IMAGE_TAG',     defaultValue: '', description: 'Optional custom image tag')
   }
 
   environment {
-    SRC_DIR = "src"
+    SRC_DIR        = "src"
+    DOCKERFILE     = "Dockerfile"
+    BUILD_CONTEXT  = ""
+    FULL_IMAGE     = ""
+    FINAL_TAG      = ""
+    GIT_COMMIT_SHA = ""
   }
 
   stages {
 
-    stage('Checkout Repo') {
+    stage('Init Environment') {
+      steps {
+        script {
+          env.SERVICE_NAME = params.PROJECT_NAME
+          env.BUILD_CONTEXT = "${env.SRC_DIR}/${env.SERVICE_NAME}"
+          env.FINAL_TAG = params.IMAGE_TAG?.trim()
+            ? params.IMAGE_TAG
+            : "${env.SERVICE_NAME}-${env.BUILD_NUMBER}"
+
+          env.FULL_IMAGE = "${params.ECR_REGISTRY}/${params.ECR_REPO}:${env.FINAL_TAG}"
+        }
+      }
+    }
+
+    stage('Checkout Source') {
       steps {
         container('git') {
           sh """
@@ -56,109 +67,72 @@ spec:
             rm -rf ${SRC_DIR}
             git clone ${params.REPO_URL} ${SRC_DIR}
             cd ${SRC_DIR}
-            git fetch --tags --force
+            git checkout ${params.GIT_REF}
+            git rev-parse HEAD > /tmp/commit
+          """
+
+          script {
+            env.GIT_COMMIT_SHA = sh(
+              script: "cat /tmp/commit",
+              returnStdout: true
+            ).trim()
+          }
+        }
+      }
+    }
+
+    stage('Validate Inputs') {
+      steps {
+        container('git') {
+          sh """
+            set -e
+
+            test -n "${SERVICE_NAME}"
+            test -d ${BUILD_CONTEXT}
+            test -f ${BUILD_CONTEXT}/${DOCKERFILE}
+          """
+
+          echo """
+CI Build Context
+----------------
+Service Name   : ${SERVICE_NAME}
+Git Ref        : ${params.GIT_REF}
+Commit SHA     : ${GIT_COMMIT_SHA}
+Build Context  : ${BUILD_CONTEXT}
+Dockerfile     : ${DOCKERFILE}
+Image          : ${FULL_IMAGE}
+"""
+        }
+      }
+    }
+
+    stage('Build Image') {
+      steps {
+        container('kaniko') {
+          sh """
+            set -eux
+
+            /kaniko/executor \
+              --context dir://${WORKSPACE}/${BUILD_CONTEXT} \
+              --dockerfile ${WORKSPACE}/${BUILD_CONTEXT}/${DOCKERFILE} \
+              --destination ${FULL_IMAGE} \
+              --no-push \
+              --cache=true
           """
         }
       }
     }
 
-    stage('Detect Tag') {
-      steps {
-        container('git') {
-          script {
-            String ref = (env.GIT_REF ?: "").trim()
-
-            if (!ref) {
-              ref = sh(
-                script: """
-                  set -e
-                  cd ${SRC_DIR}
-                  git for-each-ref --sort=-creatordate \
-                    --format '%(refname:short)' refs/tags | head -n 1
-                """,
-                returnStdout: true
-              ).trim()
-
-              if (!ref) {
-                error "No tag found and no webhook ref provided"
-              }
-
-              ref = "refs/tags/${ref}"
-            }
-
-            if (!ref.startsWith("refs/tags/")) {
-              error "Not a tag ref: ${ref}"
-            }
-
-            String tag = ref.replaceFirst("^refs/tags/", "").trim()
-
-            // <service>-vX.Y.Z
-            def m = (tag =~ /^(.+)-v(\d+\.\d+\.\d+)$/)
-            if (!m.matches()) {
-              error "Invalid tag format. Expected <service>-vX.Y.Z , got ${tag}"
-            }
-
-            env.SERVICE_NAME = m[0][1]
-            env.BASE_VERSION = m[0][2]
-            env.FINAL_VERSION = "${env.BASE_VERSION}.${env.BUILD_NUMBER}"
-            env.TAG_NAME = tag
-
-            echo """
-Triggered tag : ${env.TAG_NAME}
-Service       : ${env.SERVICE_NAME}
-Base version  : ${env.BASE_VERSION}
-Build number  : ${env.BUILD_NUMBER}
-Final version : ${env.FINAL_VERSION}
-""".stripIndent()
-          }
-        }
-      }
-    }
-
-    stage('Resolve Service Path') {
-      steps {
-        container('git') {
-          script {
-            String svcPath = env.SERVICE_NAME
-
-            def exists = sh(
-              script: "set -e; test -d ${SRC_DIR}/${svcPath} && echo OK || echo NO",
-              returnStdout: true
-            ).trim()
-
-            if (exists != "OK") {
-              error "Service folder not found: ${SRC_DIR}/${svcPath}"
-            }
-
-            env.SVC_PATH = svcPath
-            env.SVC_DOCKERFILE = "Dockerfile"
-
-            echo "Building service '${env.SERVICE_NAME}' from '${env.SVC_PATH}'"
-          }
-        }
-      }
-    }
-
-    stage('Build & Push Image') {
+    stage('Push Image') {
       steps {
         container('kaniko') {
-          script {
-            env.IMAGE = "${params.ECR_REGISTRY}/${params.ECR_REPO}"
-            env.IMAGE_TAG = "${env.SERVICE_NAME}-${env.FINAL_VERSION}"
-          }
-
           sh """
             set -eux
 
-            echo "IMAGE       = ${IMAGE}"
-            echo "TAG         = ${IMAGE_TAG}"
-            echo "CONTEXT     = ${WORKSPACE}/${SRC_DIR}/${SVC_PATH}"
-            echo "DOCKERFILE  = ${WORKSPACE}/${SRC_DIR}/${SVC_PATH}/${SVC_DOCKERFILE}"
-
             /kaniko/executor \
-              --context dir://${WORKSPACE}/${SRC_DIR}/${SVC_PATH} \
-              --dockerfile ${WORKSPACE}/${SRC_DIR}/${SVC_PATH}/${SVC_DOCKERFILE} \
-              --destination ${IMAGE}:${IMAGE_TAG} \
+              --context dir://${WORKSPACE}/${BUILD_CONTEXT} \
+              --dockerfile ${WORKSPACE}/${BUILD_CONTEXT}/${DOCKERFILE} \
+              --destination ${FULL_IMAGE} \
               --cache=true
           """
         }
@@ -167,8 +141,14 @@ Final version : ${env.FINAL_VERSION}
 
     stage('Summary') {
       steps {
-        echo "✅ Pushed image:"
-        echo "   ${env.IMAGE}:${env.IMAGE_TAG}"
+        echo """
+✅ CI completed successfully
+
+Service     : ${SERVICE_NAME}
+Repository  : ${params.REPO_URL}
+Commit      : ${GIT_COMMIT_SHA}
+Image       : ${FULL_IMAGE}
+"""
       }
     }
   }
