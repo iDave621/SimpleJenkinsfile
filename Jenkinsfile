@@ -26,35 +26,70 @@ spec:
   }
 
   parameters {
-    string(name: 'REPO_URL',      defaultValue: '', description: 'Git repository URL')
-    string(name: 'GIT_REF',       defaultValue: 'main', description: 'Branch / tag / commit')
-    string(name: 'PROJECT_NAME',  defaultValue: '', description: 'Microservice folder name')
-    string(name: 'ECR_REGISTRY',  defaultValue: '', description: 'ECR registry')
-    string(name: 'ECR_REPO',      defaultValue: '', description: 'ECR repository name')
-    string(name: 'IMAGE_TAG',     defaultValue: '', description: 'Optional custom image tag')
+    string(name: 'REPO_URL',     description: 'Git repository URL')
+    string(name: 'GIT_REF',      description: 'Git tag: <project>-vX.Y.Z')
+    string(name: 'PROJECT_NAME', description: 'Microservice name (folder + ECR repo)')
+    string(name: 'ECR_REGISTRY', description: 'ECR registry (account.dkr.ecr.region.amazonaws.com)')
   }
 
   environment {
-    SRC_DIR        = "src"
-    DOCKERFILE     = "Dockerfile"
-    BUILD_CONTEXT  = ""
-    FULL_IMAGE     = ""
-    FINAL_TAG      = ""
-    GIT_COMMIT_SHA = ""
+    SRC_DIR       = "src"
+    SERVICE_NAME  = ""
+    GIT_TAG       = ""
+    VERSION       = ""
+    FINAL_TAG     = ""
+    BUILD_CONTEXT = ""
+    IMAGE_NAME    = ""
+    FULL_IMAGE    = ""
   }
 
   stages {
 
-    stage('Init Environment') {
+    stage('Init & Resolve Metadata') {
       steps {
-        script {
-          env.SERVICE_NAME = params.PROJECT_NAME
-          env.BUILD_CONTEXT = "${env.SRC_DIR}/${env.SERVICE_NAME}"
-          env.FINAL_TAG = params.IMAGE_TAG?.trim()
-            ? params.IMAGE_TAG
-            : "${env.SERVICE_NAME}-${env.BUILD_NUMBER}"
+        container('git') {
+          script {
+            env.SERVICE_NAME = params.PROJECT_NAME?.trim()
+            env.GIT_TAG      = params.GIT_REF?.trim()
 
-          env.FULL_IMAGE = "${params.ECR_REGISTRY}/${params.ECR_REPO}:${env.FINAL_TAG}"
+            if (!env.SERVICE_NAME) {
+              error "PROJECT_NAME is required"
+            }
+
+            if (!env.GIT_TAG) {
+              error "GIT_REF is required"
+            }
+
+            String expectedPrefix = "${env.SERVICE_NAME}-"
+
+            if (!env.GIT_TAG.startsWith(expectedPrefix)) {
+              error "Git tag '${env.GIT_TAG}' must start with '${expectedPrefix}'"
+            }
+
+            // Extract version without regex
+            env.VERSION = env.GIT_TAG.substring(expectedPrefix.length())
+
+            if (!env.VERSION.startsWith("v")) {
+              error "Version '${env.VERSION}' must start with 'v'"
+            }
+
+            env.FINAL_TAG     = "${env.VERSION}.${env.BUILD_NUMBER}"
+            env.BUILD_CONTEXT = "${env.SRC_DIR}/${env.SERVICE_NAME}"
+            env.IMAGE_NAME    = env.SERVICE_NAME
+            env.FULL_IMAGE    = "${params.ECR_REGISTRY}/${env.IMAGE_NAME}:${env.FINAL_TAG}"
+
+            echo """
+Resolved Build Info
+-------------------
+Project        : ${env.SERVICE_NAME}
+Git Tag        : ${env.GIT_TAG}
+Base Version   : ${env.VERSION}
+Build Number   : ${env.BUILD_NUMBER}
+Final Tag      : ${env.FINAL_TAG}
+ECR Repository : ${env.IMAGE_NAME}
+Image          : ${env.FULL_IMAGE}
+"""
+          }
         }
       }
     }
@@ -67,41 +102,20 @@ spec:
             rm -rf ${SRC_DIR}
             git clone ${params.REPO_URL} ${SRC_DIR}
             cd ${SRC_DIR}
-            git checkout ${params.GIT_REF}
-            git rev-parse HEAD > /tmp/commit
+            git checkout ${env.GIT_TAG}
           """
-
-          script {
-            env.GIT_COMMIT_SHA = sh(
-              script: "cat /tmp/commit",
-              returnStdout: true
-            ).trim()
-          }
         }
       }
     }
 
-    stage('Validate Inputs') {
+    stage('Validate Build Context') {
       steps {
         container('git') {
           sh """
             set -e
-
-            test -n "${SERVICE_NAME}"
             test -d ${BUILD_CONTEXT}
-            test -f ${BUILD_CONTEXT}/${DOCKERFILE}
+            test -f ${BUILD_CONTEXT}/Dockerfile
           """
-
-          echo """
-CI Build Context
-----------------
-Service Name   : ${SERVICE_NAME}
-Git Ref        : ${params.GIT_REF}
-Commit SHA     : ${GIT_COMMIT_SHA}
-Build Context  : ${BUILD_CONTEXT}
-Dockerfile     : ${DOCKERFILE}
-Image          : ${FULL_IMAGE}
-"""
         }
       }
     }
@@ -114,7 +128,7 @@ Image          : ${FULL_IMAGE}
 
             /kaniko/executor \
               --context dir://${WORKSPACE}/${BUILD_CONTEXT} \
-              --dockerfile ${WORKSPACE}/${BUILD_CONTEXT}/${DOCKERFILE} \
+              --dockerfile ${WORKSPACE}/${BUILD_CONTEXT}/Dockerfile \
               --destination ${FULL_IMAGE} \
               --no-push \
               --cache=true
@@ -131,7 +145,7 @@ Image          : ${FULL_IMAGE}
 
             /kaniko/executor \
               --context dir://${WORKSPACE}/${BUILD_CONTEXT} \
-              --dockerfile ${WORKSPACE}/${BUILD_CONTEXT}/${DOCKERFILE} \
+              --dockerfile ${WORKSPACE}/${BUILD_CONTEXT}/Dockerfile \
               --destination ${FULL_IMAGE} \
               --cache=true
           """
@@ -144,10 +158,8 @@ Image          : ${FULL_IMAGE}
         echo """
 ✅ CI completed successfully
 
-Service     : ${SERVICE_NAME}
-Repository  : ${params.REPO_URL}
-Commit      : ${GIT_COMMIT_SHA}
-Image       : ${FULL_IMAGE}
+Service : ${SERVICE_NAME}
+Image   : ${FULL_IMAGE}
 """
       }
     }
