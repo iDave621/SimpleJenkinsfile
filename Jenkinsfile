@@ -22,7 +22,6 @@ spec:
 
   options {
     disableConcurrentBuilds()
-    timestamps()
   }
 
   parameters {
@@ -66,7 +65,6 @@ spec:
               error "Git tag '${env.GIT_TAG}' must start with '${expectedPrefix}'"
             }
 
-            // Extract version without regex
             env.VERSION = env.GIT_TAG.substring(expectedPrefix.length())
 
             if (!env.VERSION.startsWith("v")) {
