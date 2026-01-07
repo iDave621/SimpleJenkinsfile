@@ -1,5 +1,4 @@
 pipeline {
-
   agent {
     kubernetes {
       defaultContainer 'kaniko'
@@ -9,140 +8,168 @@ kind: Pod
 spec:
   serviceAccountName: jenkins-sa
   containers:
-  - name: jnlp
-    image: jenkins/inbound-agent:latest
-
   - name: git
-    image: alpine/git:latest
-    command: ['sh', '-c', 'cat']
+    image: alpine/git:2.45.2
+    command: ['sh','-c','cat']
     tty: true
-
   - name: kaniko
     image: gcr.io/kaniko-project/executor:debug
-    command: ['sh', '-c', 'cat']
+    command: ['sh','-c','cat']
     tty: true
 """
     }
   }
 
+  parameters {
+    string(
+      name: 'REPO_URL',
+      defaultValue: 'https://github.com/iDave621/AWS-Luxe-Jewelry-Store',
+      description: 'Git repository to build from'
+    )
+    string(
+      name: 'ECR_REGISTRY',
+      defaultValue: '553817834164.dkr.ecr.us-east-1.amazonaws.com',
+      description: 'ECR registry'
+    )
+    string(
+      name: 'ECR_REPO',
+      defaultValue: 'luxe-jewelry-store',
+      description: 'Single ECR repository name'
+    )
+  }
+
+  options {
+    disableConcurrentBuilds()
+  }
+
   environment {
-    AWS_REGION      = 'us-east-1'
-    AWS_ACCOUNT_ID = '553817834164'
-    ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    SRC_DIR = "src"
   }
 
   stages {
 
-    stage('Validate Tag Build') {
-      steps {
-        script {
-          if (!env.GIT_TAG_NAME) {
-            error("❌ CI runs only on Git tags")
-          }
-
-          // Strip leading 'v' if exists
-          env.BASE_TAG = env.GIT_TAG_NAME.replaceFirst(/^v/, '')
-          env.IMAGE_TAG = "${env.BASE_TAG}.${env.BUILD_NUMBER}"
-
-          echo "🏷️ Git tag: ${env.GIT_TAG_NAME}"
-          echo "🐳 Image tag: ${env.IMAGE_TAG}"
-        }
-      }
-    }
-
-    stage('Checkout Code') {
+    stage('Checkout Repo') {
       steps {
         container('git') {
-          checkout scm
+          sh """
+            set -eux
+            rm -rf ${SRC_DIR}
+            git clone ${params.REPO_URL} ${SRC_DIR}
+            cd ${SRC_DIR}
+            git fetch --tags --force
+          """
         }
       }
     }
 
-    stage('Detect Changed Services') {
+    stage('Detect Tag') {
       steps {
-        script {
-          def changedFiles = sh(
-            script: "git diff --name-only HEAD~1 HEAD || true",
-            returnStdout: true
-          ).trim().split("\\n")
+        container('git') {
+          script {
+            String ref = (env.GIT_REF ?: "").trim()
 
-          def services = [:]
+            if (!ref) {
+              ref = sh(
+                script: """
+                  set -e
+                  cd ${SRC_DIR}
+                  git for-each-ref --sort=-creatordate \
+                    --format '%(refname:short)' refs/tags | head -n 1
+                """,
+                returnStdout: true
+              ).trim()
 
-          if (changedFiles.any { it.startsWith("backend/") }) {
-            services.backend = [
-              path: 'backend',
-              image: 'luxe-jewelry-store-backend'
-            ]
-          }
-
-          if (changedFiles.any { it.startsWith("auth/") }) {
-            services.auth = [
-              path: 'auth',
-              image: 'luxe-jewelry-store-auth'
-            ]
-          }
-
-          if (changedFiles.any { it.startsWith("frontend/") }) {
-            services.frontend = [
-              path: 'frontend',
-              image: 'luxe-jewelry-store-frontend'
-            ]
-          }
-
-          if (services.isEmpty()) {
-            echo "⚠️ No microservice changes detected"
-            currentBuild.result = 'SUCCESS'
-            return
-          }
-
-          env.SERVICES_TO_BUILD = groovy.json.JsonOutput.toJson(services)
-        }
-      }
-    }
-
-    stage('Build & Push Images (Kaniko)') {
-      when {
-        expression { env.SERVICES_TO_BUILD }
-      }
-      steps {
-        script {
-          def services = new groovy.json.JsonSlurperClassic()
-            .parseText(env.SERVICES_TO_BUILD)
-
-          def builds = [:]
-
-          services.each { name, svc ->
-            builds[name] = {
-              container('kaniko') {
-                sh """
-                  echo "🚀 Building ${name}"
-
-                  /kaniko/executor \
-                    --context=${svc.path} \
-                    --dockerfile=Dockerfile \
-                    --destination=${ECR_REGISTRY}/${svc.image}:${IMAGE_TAG} \
-                    --destination=${ECR_REGISTRY}/${svc.image}:latest \
-                    --cache=true \
-                    --cache-ttl=24h
-                """
+              if (!ref) {
+                error "No tag found and no webhook ref provided"
               }
-            }
-          }
 
-          parallel builds
+              ref = "refs/tags/${ref}"
+            }
+
+            if (!ref.startsWith("refs/tags/")) {
+              error "Not a tag ref: ${ref}"
+            }
+
+            String tag = ref.replaceFirst("^refs/tags/", "").trim()
+
+            // <service>-vX.Y.Z
+            def m = (tag =~ /^(.+)-v(\d+\.\d+\.\d+)$/)
+            if (!m.matches()) {
+              error "Invalid tag format. Expected <service>-vX.Y.Z , got ${tag}"
+            }
+
+            env.SERVICE_NAME = m[0][1]
+            env.BASE_VERSION = m[0][2]
+            env.FINAL_VERSION = "${env.BASE_VERSION}.${env.BUILD_NUMBER}"
+            env.TAG_NAME = tag
+
+            echo """
+Triggered tag : ${env.TAG_NAME}
+Service       : ${env.SERVICE_NAME}
+Base version  : ${env.BASE_VERSION}
+Build number  : ${env.BUILD_NUMBER}
+Final version : ${env.FINAL_VERSION}
+""".stripIndent()
+          }
         }
       }
     }
-  }
 
-  post {
-    success {
-      echo "✅ CI finished successfully"
-      echo "🏷️ Image tag: ${IMAGE_TAG}"
-      echo "🚀 Argo CD will deploy automatically"
+    stage('Resolve Service Path') {
+      steps {
+        container('git') {
+          script {
+            String svcPath = env.SERVICE_NAME
+
+            def exists = sh(
+              script: "set -e; test -d ${SRC_DIR}/${svcPath} && echo OK || echo NO",
+              returnStdout: true
+            ).trim()
+
+            if (exists != "OK") {
+              error "Service folder not found: ${SRC_DIR}/${svcPath}"
+            }
+
+            env.SVC_PATH = svcPath
+            env.SVC_DOCKERFILE = "Dockerfile"
+
+            echo "Building service '${env.SERVICE_NAME}' from '${env.SVC_PATH}'"
+          }
+        }
+      }
     }
-    failure {
-      echo "❌ CI failed"
+
+    stage('Build & Push Image') {
+      steps {
+        container('kaniko') {
+          script {
+            env.IMAGE = "${params.ECR_REGISTRY}/${params.ECR_REPO}"
+            env.IMAGE_TAG = "${env.SERVICE_NAME}-${env.FINAL_VERSION}"
+          }
+
+          sh """
+            set -eux
+
+            echo "IMAGE       = ${IMAGE}"
+            echo "TAG         = ${IMAGE_TAG}"
+            echo "CONTEXT     = ${WORKSPACE}/${SRC_DIR}/${SVC_PATH}"
+            echo "DOCKERFILE  = ${WORKSPACE}/${SRC_DIR}/${SVC_PATH}/${SVC_DOCKERFILE}"
+
+            /kaniko/executor \
+              --context dir://${WORKSPACE}/${SRC_DIR}/${SVC_PATH} \
+              --dockerfile ${WORKSPACE}/${SRC_DIR}/${SVC_PATH}/${SVC_DOCKERFILE} \
+              --destination ${IMAGE}:${IMAGE_TAG} \
+              --cache=true
+          """
+        }
+      }
+    }
+
+    stage('Summary') {
+      steps {
+        echo "✅ Pushed image:"
+        echo "   ${env.IMAGE}:${env.IMAGE_TAG}"
+      }
     }
   }
 }
